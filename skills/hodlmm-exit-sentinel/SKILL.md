@@ -102,4 +102,5 @@ All outputs are JSON to stdout.
 - Requires local AIBTC wallet metadata to resolve the default active address.
 - Uses Bitflow public app and quote APIs plus Bitflow user-position endpoints.
 - Position discovery depends on live Bitflow position responses and treats missing pool bins as "no position".
+- Price divergence is computed in USD using Bitflow app token prices for the paired asset, so accurate divergence scoring depends on Bitflow app price availability for both sides of the pool.
 - This is a position-protection signal, not an execution skill. Any actual withdraw or rebalance must happen in a separate writer skill.

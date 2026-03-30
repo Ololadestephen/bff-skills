@@ -283,6 +283,11 @@ async function fetchPositionBins(address: string, poolId: string): Promise<Posit
         "User-Agent": "bff-skills/hodlmm-exit-sentinel",
       },
     });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return null;
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
@@ -343,7 +348,9 @@ function getActiveSbtcPriceUsd(appPool: AppPool, activeBinPriceRaw: number): num
     tokenX.symbol?.toLowerCase() === "sbtc";
 
   if (tokenXIsSbtc) {
-    return normalizedPrice;
+    const tokenYPriceUsd = toNumber(tokenY.priceUsd);
+    if (tokenYPriceUsd <= 0) return 0;
+    return normalizedPrice * tokenYPriceUsd;
   }
 
   const tokenXPriceUsd = toNumber(tokenX.priceUsd);
@@ -513,14 +520,18 @@ async function collectPositionAssessments(options: RunOptions): Promise<{
 
   await Promise.all(
     targetPools.map(async (quotePool) => {
-      const appPool = appPoolMap.get(quotePool.pool_id);
-      if (!appPool) return;
+      try {
+        const appPool = appPoolMap.get(quotePool.pool_id);
+        if (!appPool) return;
 
-      const positionBins = await fetchPositionBins(wallet.stacksAddress, quotePool.pool_id);
-      if (!positionBins || positionBins.length === 0) return;
+        const positionBins = await fetchPositionBins(wallet.stacksAddress, quotePool.pool_id);
+        if (!positionBins || positionBins.length === 0) return;
 
-      const binsResponse = await fetchBins(quotePool.pool_id);
-      assessments.push(assessPosition(quotePool, appPool, binsResponse, positionBins, options));
+        const binsResponse = await fetchBins(quotePool.pool_id);
+        assessments.push(assessPosition(quotePool, appPool, binsResponse, positionBins, options));
+      } catch {
+        return;
+      }
     }),
   );
 
@@ -749,7 +760,7 @@ program
         top: Math.max(1, Math.floor(toNumber(rawOptions.top) || DEFAULT_TOP_COUNT)),
       };
 
-      if (options.address && !/^SP[A-Z0-9]{30,}$/i.test(options.address)) {
+      if (options.address && !/^SP[A-Z0-9]{30,}$/.test(options.address)) {
         printFlatError("address must be a valid Stacks mainnet address");
       }
       if (options.poolId && !/^[A-Za-z0-9_-]+$/.test(options.poolId)) {
