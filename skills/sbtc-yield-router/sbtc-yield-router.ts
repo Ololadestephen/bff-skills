@@ -1,7 +1,6 @@
 #!/usr/bin/env bun
 
 import { Command } from "commander";
-import { readFileSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 
@@ -10,6 +9,8 @@ const AIBTC_CONFIG_PATH = join(AIBTC_HOME, "config.json");
 const AIBTC_WALLETS_PATH = join(AIBTC_HOME, "wallets.json");
 const BITFLOW_API = "https://bff.bitflowapis.finance";
 const HIRO_API = "https://api.mainnet.hiro.so";
+const SBTC_TOKEN_CONTRACT = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token";
+const ZEST_POOL_BORROW = "SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N.pool-borrow-v2-3";
 const FETCH_TIMEOUT_MS = 30_000;
 const MIN_GAS_USTX = 100_000;
 const DEFAULT_RESERVE_SATS = 200_000;
@@ -77,6 +78,14 @@ interface AppPoolsResponse {
   data?: AppPool[];
 }
 
+interface ContractFunction {
+  name?: string;
+}
+
+interface ContractInterfaceResponse {
+  functions?: ContractFunction[];
+}
+
 interface WalletSnapshot {
   walletName: string;
   stacksAddress: string;
@@ -118,6 +127,11 @@ interface SkillOutput {
   error: { code: string; message: string; next: string } | null;
 }
 
+interface ZestReadiness {
+  ok: boolean;
+  detail: string;
+}
+
 function printFlatError(message: string): never {
   console.log(JSON.stringify({ error: message }, null, 2));
   process.exit(1);
@@ -140,13 +154,15 @@ function clamp(value: number, min: number, max: number): number {
   return Math.min(Math.max(value, min), max);
 }
 
-function parseJsonFile<T>(path: string): T {
-  return JSON.parse(readFileSync(path, "utf8")) as T;
+async function parseJsonFile<T>(path: string): Promise<T> {
+  return await Bun.file(path).json() as T;
 }
 
-function loadActiveWallet(): StoredWallet {
-  const config = parseJsonFile<WalletConfig>(AIBTC_CONFIG_PATH);
-  const store = parseJsonFile<WalletStore>(AIBTC_WALLETS_PATH);
+async function loadActiveWallet(): Promise<StoredWallet> {
+  const [config, store] = await Promise.all([
+    parseJsonFile<WalletConfig>(AIBTC_CONFIG_PATH),
+    parseJsonFile<WalletStore>(AIBTC_WALLETS_PATH),
+  ]);
   if (!config.activeWalletId) {
     throw new Error("AIBTC config does not contain an activeWalletId");
   }
@@ -184,12 +200,12 @@ async function getStxBalance(address: string): Promise<number> {
 
 async function getSbtcBalance(address: string): Promise<number> {
   const data = await fetchJson<HiroBalancesResponse>(`${HIRO_API}/extended/v1/address/${address}/balances`);
-  const ftKey = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token::sbtc-token";
+  const ftKey = `${SBTC_TOKEN_CONTRACT}::sbtc-token`;
   return toNumber(data.fungible_tokens?.[ftKey]?.balance);
 }
 
 async function getWalletSnapshot(): Promise<WalletSnapshot> {
-  const wallet = loadActiveWallet();
+  const wallet = await loadActiveWallet();
   const [stxUstx, sbtcSats] = await Promise.all([
     getStxBalance(wallet.address),
     getSbtcBalance(wallet.address),
@@ -210,8 +226,9 @@ async function fetchAppPools(): Promise<AppPool[]> {
   return response.data ?? [];
 }
 
-async function checkZestReachable(): Promise<boolean> {
-  const url = `${HIRO_API}/v2/contracts/interface/SP2VCQJGH7PHP2DJK7Z0V48AGBHQAW3R3ZW1QF4N/pool-borrow-v2-3`;
+async function checkZestReachable(): Promise<ZestReadiness> {
+  const [address, contractName] = ZEST_POOL_BORROW.split(".");
+  const url = `${HIRO_API}/v2/contracts/interface/${address}/${contractName}`;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
@@ -222,22 +239,28 @@ async function checkZestReachable(): Promise<boolean> {
         "User-Agent": "bff-skills/sbtc-yield-router",
       },
     });
-    return response.ok;
+    if (!response.ok) {
+      return { ok: false, detail: `HTTP ${response.status}` };
+    }
+    const payload = await response.json() as ContractInterfaceResponse;
+    const functionNames = new Set((payload.functions ?? []).map((item) => item.name).filter(Boolean));
+    const hasRequiredFns = functionNames.has("get-user-reserve-data") && functionNames.has("supply");
+    return hasRequiredFns
+      ? { ok: true, detail: "Zest interface reachable with expected reserve-data and supply functions" }
+      : { ok: false, detail: "Zest interface reachable but missing expected routing functions" };
   } catch {
-    return false;
+    return { ok: false, detail: "Zest interface unreachable" };
   } finally {
     clearTimeout(timer);
   }
 }
 
+function isSbtcToken(token: AppToken): boolean {
+  return token.contract === SBTC_TOKEN_CONTRACT || token.symbol?.toLowerCase() === "sbtc";
+}
+
 function isSbtcPool(pool: AppPool): boolean {
-  const tokens = [
-    pool.tokens.tokenX.contract.toLowerCase(),
-    pool.tokens.tokenY.contract.toLowerCase(),
-    pool.tokens.tokenX.symbol?.toLowerCase() || "",
-    pool.tokens.tokenY.symbol?.toLowerCase() || "",
-  ];
-  return tokens.some((token) => token.includes("sbtc"));
+  return isSbtcToken(pool.tokens.tokenX) || isSbtcToken(pool.tokens.tokenY);
 }
 
 function pairLabel(pool: AppPool): string {
@@ -295,12 +318,12 @@ function assessHodlmmPool(pool: AppPool, options: RunOptions): HODLMMCandidate {
 
 async function collectContext(options: RunOptions): Promise<{
   wallet: WalletSnapshot;
-  zestReachable: boolean;
+  zestReadiness: ZestReadiness;
   candidates: HODLMMCandidate[];
   bestCandidate: HODLMMCandidate | null;
   routeableSats: number;
 }> {
-  const [wallet, appPools, zestReachable] = await Promise.all([
+  const [wallet, appPools, zestReadiness] = await Promise.all([
     getWalletSnapshot(),
     fetchAppPools(),
     checkZestReachable(),
@@ -313,7 +336,7 @@ async function collectContext(options: RunOptions): Promise<{
     .sort((left, right) => right.momentumScore - left.momentumScore);
 
   const bestCandidate = candidates.find((candidate) => candidate.eligible) || null;
-  return { wallet, zestReachable, candidates, bestCandidate, routeableSats };
+  return { wallet, zestReadiness, candidates, bestCandidate, routeableSats };
 }
 
 async function runDoctor(): Promise<void> {
@@ -321,7 +344,7 @@ async function runDoctor(): Promise<void> {
   let wallet: StoredWallet | null = null;
 
   try {
-    wallet = loadActiveWallet();
+    wallet = await loadActiveWallet();
     checks.wallet = { ok: true, detail: `${wallet.address} (${wallet.btcAddress || "no btcAddress"})` };
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
@@ -350,10 +373,10 @@ async function runDoctor(): Promise<void> {
     checks.bitflow = { ok: false, detail: message };
   }
 
-  const zestReachable = await checkZestReachable();
+  const zestReadiness = await checkZestReachable();
   checks.zest = {
-    ok: zestReachable,
-    detail: zestReachable ? "Zest contract interface reachable" : "Zest contract interface unavailable",
+    ok: zestReadiness.ok,
+    detail: zestReadiness.detail,
   };
 
   const allOk = Object.values(checks).every((check) => check.ok);
@@ -384,7 +407,7 @@ async function runDoctor(): Promise<void> {
 }
 
 async function runStatus(options: RunOptions): Promise<void> {
-  const { wallet, zestReachable, candidates, bestCandidate, routeableSats } = await collectContext(options);
+  const { wallet, zestReadiness, candidates, bestCandidate, routeableSats } = await collectContext(options);
 
   printResult({
     status: "success",
@@ -398,7 +421,7 @@ async function runStatus(options: RunOptions): Promise<void> {
         routeableSats,
         maxRouteSats: options.maxRouteSats,
       },
-      zestReachable,
+      zestReadiness,
       topCandidate: bestCandidate,
       candidates: candidates.slice(0, 3),
     },
@@ -407,7 +430,7 @@ async function runStatus(options: RunOptions): Promise<void> {
 }
 
 async function runRouter(options: RunOptions): Promise<void> {
-  const { wallet, zestReachable, candidates, bestCandidate, routeableSats } = await collectContext(options);
+  const { wallet, zestReadiness, candidates, bestCandidate, routeableSats } = await collectContext(options);
   const blockedReasons: string[] = [];
 
   if (wallet.stxUstx < MIN_GAS_USTX) {
@@ -472,7 +495,7 @@ async function runRouter(options: RunOptions): Promise<void> {
     return;
   }
 
-  if (zestReachable) {
+  if (zestReadiness.ok) {
     printResult({
       status: "success",
       action: `Route ${maxRouteSats} sats to Zest as the conservative fallback`,
@@ -486,7 +509,7 @@ async function runRouter(options: RunOptions): Promise<void> {
         },
         rationale: [
           "No HODLMM pool passed the configured timing gates",
-          "Zest contract interface is reachable",
+          zestReadiness.detail,
           "Excess sBTC remains after reserve protection",
         ],
         topCandidate: candidates[0] || null,
@@ -509,7 +532,7 @@ async function runRouter(options: RunOptions): Promise<void> {
       },
       blockedReasons: [
         "No HODLMM candidate passed timing gates",
-        "Zest fallback is unavailable",
+        zestReadiness.detail,
       ],
       candidates: candidates.slice(0, 3),
     },
