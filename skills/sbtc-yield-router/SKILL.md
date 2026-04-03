@@ -14,13 +14,14 @@ metadata:
 # sBTC Yield Router
 
 ## What it does
-Reads the active AIBTC wallet, keeps a configurable sBTC operating reserve, and routes only excess sBTC into the best current destination: Bitflow HODLMM when fee and volume momentum are strong, Zest when Bitflow timing is weak but idle capital should still earn, or hold when safety gates fail. It also records local route history and enforces a cooldown between active route changes to reduce churn.
+Reads the active AIBTC wallet, keeps a configurable sBTC operating reserve, and produces a routing recommendation for excess sBTC: Bitflow HODLMM when fee and volume momentum are strong, Zest when Bitflow timing is weak but idle capital should still earn, or hold when safety gates fail. It also records local route history and enforces a cooldown between active route changes to reduce churn.
 
 ## Why agents need it
 Agents need a direct capital decision, not just isolated monitors. This skill answers the practical question: "I have idle sBTC now. Should I hold it, lend it on Zest, or deploy it to Bitflow HODLMM?" It is the routing layer between wallet balances, HODLMM timing, and conservative yield fallback.
 
 ## Safety notes
 - Read-only. This skill never signs, simulates, or submits transactions.
+- Execution is external. Any actual Zest supply or HODLMM deployment must happen in a separate writer skill after explicit operator confirmation.
 - Mainnet only. It reads live Bitflow and Hiro mainnet data and validates Zest contract reachability.
 - Wallet-aware. By default it resolves the active AIBTC wallet locally.
 - Enforces a configurable liquid reserve floor before recommending any routing action.
@@ -42,7 +43,7 @@ bun run skills/sbtc-yield-router/sbtc-yield-router.ts status
 ```
 
 ### run
-Returns a direct routing posture: `hold`, `lend-to-zest`, or `deploy-to-hodlmm`.
+Returns a direct routing posture: `hold`, `lend-to-zest`, or `deploy-to-hodlmm`, plus the required handoff to a separate writer skill when execution is desired.
 ```bash
 bun run skills/sbtc-yield-router/sbtc-yield-router.ts run
 ```
@@ -60,9 +61,11 @@ All outputs are JSON to stdout.
 ```json
 {
   "status": "success",
-  "action": "Route 500000 sats to Bitflow HODLMM pool dlmm_6",
+  "action": "Recommend routing 500000 sats to Bitflow HODLMM pool dlmm_6",
   "data": {
     "route": "deploy-to-hodlmm",
+    "executionMode": "external-writer-required",
+    "nextStep": "After explicit operator confirmation, pass this route to a separate writer skill for execution.",
     "maxRouteSats": 500000,
     "candidate": {
       "poolId": "dlmm_6",

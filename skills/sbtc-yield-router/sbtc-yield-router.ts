@@ -159,6 +159,17 @@ function printResult(result: SkillOutput): void {
   console.log(JSON.stringify(result, null, 2));
 }
 
+function advisoryExecutionData(route: Route): Record<string, string> {
+  return {
+    executionMode: "external-writer-required",
+    executionAuthority: "separate-writer-skill",
+    nextStep:
+      route === "hold"
+        ? "Do not execute. Re-run later when reserve, gas, and market conditions improve."
+        : "After explicit operator confirmation, pass this route to a separate writer skill for execution.",
+  };
+}
+
 function toNumber(value: string | number | undefined | null): number {
   if (typeof value === "number") return Number.isFinite(value) ? value : 0;
   if (typeof value === "string" && value.trim().length > 0) {
@@ -428,7 +439,10 @@ async function runDoctor(): Promise<void> {
     printResult({
       status: "success",
       action: "Environment ready. Run status or run to route idle sBTC.",
-      data: { checks },
+      data: {
+        ...advisoryExecutionData("hold"),
+        checks,
+      },
       error: null,
     });
     return;
@@ -441,7 +455,11 @@ async function runDoctor(): Promise<void> {
   printResult({
     status: "blocked",
     action: "Resolve the reported blockers before routing idle sBTC.",
-    data: { checks, blockers },
+    data: {
+      ...advisoryExecutionData("hold"),
+      checks,
+      blockers,
+    },
     error: {
       code: "DOCTOR_FAILED",
       message: blockers.join("; "),
@@ -461,6 +479,7 @@ async function runStatus(options: RunOptions): Promise<void> {
       ? `Top HODLMM candidate is ${bestCandidate.poolId} with signal ${bestCandidate.momentumSignal}`
       : "No HODLMM candidate currently passes the configured timing gates",
     data: {
+      ...advisoryExecutionData("hold"),
       wallet,
       reserve: {
         reserveSats: options.reserveSats,
@@ -504,6 +523,7 @@ async function runRouter(options: RunOptions): Promise<void> {
       action: "Hold idle sBTC until reserve, gas, or balance conditions improve",
       data: {
         route: "hold",
+        ...advisoryExecutionData("hold"),
         wallet,
         reserve: {
           reserveSats: options.reserveSats,
@@ -536,7 +556,7 @@ async function runRouter(options: RunOptions): Promise<void> {
   if (bestCandidate) {
     proposedRoute = "deploy-to-hodlmm";
     proposedPoolId = bestCandidate.poolId;
-    action = `Route ${maxRouteSats} sats to Bitflow HODLMM pool ${bestCandidate.poolId}`;
+    action = `Recommend routing ${maxRouteSats} sats to Bitflow HODLMM pool ${bestCandidate.poolId}`;
     rationale = [
       `momentum signal ${bestCandidate.momentumSignal}`,
       `momentum score ${bestCandidate.momentumScore}`,
@@ -546,7 +566,7 @@ async function runRouter(options: RunOptions): Promise<void> {
     ];
   } else if (zestReadiness.ok) {
     proposedRoute = "lend-to-zest";
-    action = `Route ${maxRouteSats} sats to Zest as the conservative fallback`;
+    action = `Recommend routing ${maxRouteSats} sats to Zest as the conservative fallback`;
     rationale = [
       "No HODLMM pool passed the configured timing gates",
       zestReadiness.detail,
@@ -558,6 +578,7 @@ async function runRouter(options: RunOptions): Promise<void> {
       action: "Hold idle sBTC until either HODLMM timing improves or Zest becomes reachable",
       data: {
         route: "hold",
+        ...advisoryExecutionData("hold"),
         wallet,
         reserve: {
           reserveSats: options.reserveSats,
@@ -604,6 +625,7 @@ async function runRouter(options: RunOptions): Promise<void> {
       action: "Hold route change due to cooldown protection",
       data: {
         route: "hold",
+        ...advisoryExecutionData("hold"),
         wallet,
         reserve: {
           reserveSats: options.reserveSats,
@@ -657,6 +679,7 @@ async function runRouter(options: RunOptions): Promise<void> {
     action,
     data: {
       route: proposedRoute,
+      ...advisoryExecutionData(proposedRoute),
       wallet,
       reserve: {
         reserveSats: options.reserveSats,

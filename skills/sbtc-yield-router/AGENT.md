@@ -31,6 +31,7 @@ description: "Chooses whether idle sBTC should be held, lent to Zest, or deploye
 - Surface the chosen route, capped route size, and reasons.
 - If routing to HODLMM, include the named pool and momentum signal.
 - If routing to Zest, present it as the conservative fallback, not the aggressive route.
+- Always state that execution remains external and requires a separate writer skill after explicit operator confirmation.
 
 ## On error
 - Surface the error payload verbatim.
