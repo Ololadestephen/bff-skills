@@ -17,6 +17,7 @@ description: "Chooses whether idle sBTC should be held, lent to Zest, or deploye
 - Never route below the configured sBTC reserve floor.
 - Never route more than the reported `maxRouteSats`.
 - Never deploy to HODLMM unless the selected pool passes the configured volume, TVL, and momentum thresholds.
+- Never switch active routes inside the cooldown window unless the new HODLMM signal is materially stronger.
 - Never treat this skill as execution authority. It is a routing and gating skill only.
 - Never expose wallet files, keystore contents, or secrets in logs or outputs.
 

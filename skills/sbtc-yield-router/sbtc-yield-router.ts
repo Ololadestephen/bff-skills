@@ -18,10 +18,13 @@ const DEFAULT_MAX_ROUTE_SATS = 500_000;
 const DEFAULT_MIN_HODLMM_SCORE = 120;
 const DEFAULT_MIN_HODLMM_VOLUME_USD = 25_000;
 const DEFAULT_MIN_HODLMM_TVL_USD = 25_000;
+const DEFAULT_ROUTE_COOLDOWN_HOURS = 4;
+const STATE_FILE = join(homedir(), ".sbtc-yield-router-state.json");
 
 type SkillStatus = "success" | "error" | "blocked";
 type Route = "hold" | "lend-to-zest" | "deploy-to-hodlmm";
 type MomentumSignal = "spike" | "elevated" | "normal" | "cooling" | "flat";
+type RouteTrend = "new" | "stable" | "changed" | "cooldown-blocked";
 
 interface WalletConfig {
   version: number;
@@ -118,6 +121,7 @@ interface RunOptions {
   minHodlmmScore: number;
   minHodlmmVolumeUsd: number;
   minHodlmmTvlUsd: number;
+  routeCooldownHours: number;
 }
 
 interface SkillOutput {
@@ -130,6 +134,20 @@ interface SkillOutput {
 interface ZestReadiness {
   ok: boolean;
   detail: string;
+}
+
+interface RouteHistoryEntry {
+  route: Route;
+  poolId: string | null;
+  maxRouteSats: number;
+  timestamp: string;
+}
+
+interface RouterState {
+  lastRoute?: Route;
+  lastPoolId?: string | null;
+  lastDecisionAt?: string;
+  history?: RouteHistoryEntry[];
 }
 
 function printFlatError(message: string): never {
@@ -156,6 +174,18 @@ function clamp(value: number, min: number, max: number): number {
 
 async function parseJsonFile<T>(path: string): Promise<T> {
   return await Bun.file(path).json() as T;
+}
+
+async function readState(): Promise<RouterState> {
+  try {
+    return await Bun.file(STATE_FILE).json() as RouterState;
+  } catch {
+    return {};
+  }
+}
+
+async function writeState(nextState: RouterState): Promise<void> {
+  await Bun.write(STATE_FILE, JSON.stringify(nextState, null, 2));
 }
 
 async function loadActiveWallet(): Promise<StoredWallet> {
@@ -322,11 +352,13 @@ async function collectContext(options: RunOptions): Promise<{
   candidates: HODLMMCandidate[];
   bestCandidate: HODLMMCandidate | null;
   routeableSats: number;
+  state: RouterState;
 }> {
-  const [wallet, appPools, zestReadiness] = await Promise.all([
+  const [wallet, appPools, zestReadiness, state] = await Promise.all([
     getWalletSnapshot(),
     fetchAppPools(),
     checkZestReachable(),
+    readState(),
   ]);
 
   const routeableSats = Math.max(0, wallet.sbtcSats - options.reserveSats);
@@ -336,7 +368,7 @@ async function collectContext(options: RunOptions): Promise<{
     .sort((left, right) => right.momentumScore - left.momentumScore);
 
   const bestCandidate = candidates.find((candidate) => candidate.eligible) || null;
-  return { wallet, zestReadiness, candidates, bestCandidate, routeableSats };
+  return { wallet, zestReadiness, candidates, bestCandidate, routeableSats, state };
 }
 
 async function runDoctor(): Promise<void> {
@@ -379,6 +411,18 @@ async function runDoctor(): Promise<void> {
     detail: zestReadiness.detail,
   };
 
+  try {
+    const state = await readState();
+    await writeState(state);
+    checks.state_file = {
+      ok: true,
+      detail: `${STATE_FILE} readable/writable — ${state.history?.length || 0} stored route snapshots`,
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    checks.state_file = { ok: false, detail: message };
+  }
+
   const allOk = Object.values(checks).every((check) => check.ok);
   if (allOk) {
     printResult({
@@ -407,7 +451,9 @@ async function runDoctor(): Promise<void> {
 }
 
 async function runStatus(options: RunOptions): Promise<void> {
-  const { wallet, zestReadiness, candidates, bestCandidate, routeableSats } = await collectContext(options);
+  const { wallet, zestReadiness, candidates, bestCandidate, routeableSats, state } = await collectContext(options);
+  const lastDecisionAt = state.lastDecisionAt || null;
+  const lastRoute = state.lastRoute || null;
 
   printResult({
     status: "success",
@@ -421,6 +467,13 @@ async function runStatus(options: RunOptions): Promise<void> {
         routeableSats,
         maxRouteSats: options.maxRouteSats,
       },
+      routerState: {
+        stateFile: STATE_FILE,
+        lastDecisionAt,
+        lastRoute,
+        historySize: state.history?.length || 0,
+        routeCooldownHours: options.routeCooldownHours,
+      },
       zestReadiness,
       topCandidate: bestCandidate,
       candidates: candidates.slice(0, 3),
@@ -430,7 +483,7 @@ async function runStatus(options: RunOptions): Promise<void> {
 }
 
 async function runRouter(options: RunOptions): Promise<void> {
-  const { wallet, zestReadiness, candidates, bestCandidate, routeableSats } = await collectContext(options);
+  const { wallet, zestReadiness, candidates, bestCandidate, routeableSats, state } = await collectContext(options);
   const blockedReasons: string[] = [];
 
   if (wallet.stxUstx < MIN_GAS_USTX) {
@@ -457,6 +510,12 @@ async function runRouter(options: RunOptions): Promise<void> {
           routeableSats,
           maxRouteSats,
         },
+        routerState: {
+          stateFile: STATE_FILE,
+          lastDecisionAt: state.lastDecisionAt || null,
+          lastRoute: state.lastRoute || null,
+          routeCooldownHours: options.routeCooldownHours,
+        },
         blockedReasons,
         candidates: candidates.slice(0, 3),
       },
@@ -469,78 +528,154 @@ async function runRouter(options: RunOptions): Promise<void> {
     return;
   }
 
+  let proposedRoute: Route = "hold";
+  let proposedPoolId: string | null = null;
+  let action = "";
+  let rationale: string[] = [];
+
   if (bestCandidate) {
+    proposedRoute = "deploy-to-hodlmm";
+    proposedPoolId = bestCandidate.poolId;
+    action = `Route ${maxRouteSats} sats to Bitflow HODLMM pool ${bestCandidate.poolId}`;
+    rationale = [
+      `momentum signal ${bestCandidate.momentumSignal}`,
+      `momentum score ${bestCandidate.momentumScore}`,
+      `fee velocity ${bestCandidate.feeVelocity}x`,
+      `24h volume $${bestCandidate.volumeUsd1d}`,
+      `APR 24h ${bestCandidate.apr24h}%`,
+    ];
+  } else if (zestReadiness.ok) {
+    proposedRoute = "lend-to-zest";
+    action = `Route ${maxRouteSats} sats to Zest as the conservative fallback`;
+    rationale = [
+      "No HODLMM pool passed the configured timing gates",
+      zestReadiness.detail,
+      "Excess sBTC remains after reserve protection",
+    ];
+  } else {
     printResult({
-      status: "success",
-      action: `Route ${maxRouteSats} sats to Bitflow HODLMM pool ${bestCandidate.poolId}`,
+      status: "blocked",
+      action: "Hold idle sBTC until either HODLMM timing improves or Zest becomes reachable",
       data: {
-        route: "deploy-to-hodlmm" as Route,
+        route: "hold",
         wallet,
         reserve: {
           reserveSats: options.reserveSats,
           routeableSats,
           maxRouteSats,
         },
-        candidate: bestCandidate,
-        rationale: [
-          `momentum signal ${bestCandidate.momentumSignal}`,
-          `momentum score ${bestCandidate.momentumScore}`,
-          `fee velocity ${bestCandidate.feeVelocity}x`,
-          `24h volume $${bestCandidate.volumeUsd1d}`,
-          `APR 24h ${bestCandidate.apr24h}%`,
+        routerState: {
+          stateFile: STATE_FILE,
+          lastDecisionAt: state.lastDecisionAt || null,
+          lastRoute: state.lastRoute || null,
+          routeCooldownHours: options.routeCooldownHours,
+        },
+        blockedReasons: [
+          "No HODLMM candidate passed timing gates",
+          zestReadiness.detail,
         ],
+        candidates: candidates.slice(0, 3),
       },
-      error: null,
+      error: {
+        code: "NO_ROUTE",
+        message: "No route passed the configured safety gates",
+        next: "Re-run later or relax thresholds with explicit operator approval",
+      },
     });
     return;
   }
 
-  if (zestReadiness.ok) {
+  const lastDecisionAt = state.lastDecisionAt ? new Date(state.lastDecisionAt).getTime() : null;
+  const elapsedHours = lastDecisionAt ? (Date.now() - lastDecisionAt) / 3_600_000 : null;
+  const changingActiveRoute =
+    Boolean(state.lastRoute) &&
+    state.lastRoute !== "hold" &&
+    state.lastRoute !== proposedRoute;
+  const cooldownActive =
+    changingActiveRoute &&
+    elapsedHours !== null &&
+    elapsedHours < options.routeCooldownHours &&
+    !(proposedRoute === "deploy-to-hodlmm" && bestCandidate?.momentumSignal === "spike");
+
+  if (cooldownActive) {
+    const remainingHours = Number((options.routeCooldownHours - (elapsedHours || 0)).toFixed(2));
     printResult({
-      status: "success",
-      action: `Route ${maxRouteSats} sats to Zest as the conservative fallback`,
+      status: "blocked",
+      action: "Hold route change due to cooldown protection",
       data: {
-        route: "lend-to-zest" as Route,
+        route: "hold",
         wallet,
         reserve: {
           reserveSats: options.reserveSats,
           routeableSats,
           maxRouteSats,
         },
-        rationale: [
-          "No HODLMM pool passed the configured timing gates",
-          zestReadiness.detail,
-          "Excess sBTC remains after reserve protection",
+        routerState: {
+          stateFile: STATE_FILE,
+          lastDecisionAt: state.lastDecisionAt || null,
+          lastRoute: state.lastRoute || null,
+          routeCooldownHours: options.routeCooldownHours,
+          remainingHours,
+          trend: "cooldown-blocked" as RouteTrend,
+        },
+        blockedReasons: [
+          `Active route change from ${state.lastRoute} to ${proposedRoute} is still within cooldown`,
         ],
-        topCandidate: candidates[0] || null,
+        candidate: bestCandidate,
       },
-      error: null,
+      error: {
+        code: "ROUTE_COOLDOWN",
+        message: `Route change blocked for another ${remainingHours} hours`,
+        next: "Re-run after cooldown or wait for a stronger HODLMM spike",
+      },
     });
     return;
   }
+
+  const trend: RouteTrend =
+    !state.lastRoute ? "new" :
+    state.lastRoute === proposedRoute && state.lastPoolId === proposedPoolId ? "stable" :
+    "changed";
+
+  const decisionTime = new Date().toISOString();
+  const history = [...(state.history || []), {
+    route: proposedRoute,
+    poolId: proposedPoolId,
+    maxRouteSats,
+    timestamp: decisionTime,
+  }].slice(-12);
+
+  await writeState({
+    lastRoute: proposedRoute,
+    lastPoolId: proposedPoolId,
+    lastDecisionAt: decisionTime,
+    history,
+  });
 
   printResult({
-    status: "blocked",
-    action: "Hold idle sBTC until either HODLMM timing improves or Zest becomes reachable",
+    status: "success",
+    action,
     data: {
-      route: "hold",
+      route: proposedRoute,
       wallet,
       reserve: {
         reserveSats: options.reserveSats,
         routeableSats,
         maxRouteSats,
       },
-      blockedReasons: [
-        "No HODLMM candidate passed timing gates",
-        zestReadiness.detail,
-      ],
-      candidates: candidates.slice(0, 3),
+      routerState: {
+        stateFile: STATE_FILE,
+        lastDecisionAt: decisionTime,
+        lastRoute: proposedRoute,
+        routeCooldownHours: options.routeCooldownHours,
+        historySize: history.length,
+        trend,
+      },
+      candidate: bestCandidate,
+      rationale,
+      topCandidate: candidates[0] || null,
     },
-    error: {
-      code: "NO_ROUTE",
-      message: "No route passed the configured safety gates",
-      next: "Re-run later or relax thresholds with explicit operator approval",
-    },
+    error: null,
   });
 }
 
@@ -571,6 +706,7 @@ program
   .option("--min-hodlmm-score <score>", "Minimum HODLMM momentum score", String(DEFAULT_MIN_HODLMM_SCORE))
   .option("--min-hodlmm-volume-usd <usd>", "Minimum HODLMM 24h volume", String(DEFAULT_MIN_HODLMM_VOLUME_USD))
   .option("--min-hodlmm-tvl-usd <usd>", "Minimum HODLMM TVL", String(DEFAULT_MIN_HODLMM_TVL_USD))
+  .option("--route-cooldown-hours <hours>", "Minimum hours between active route changes", String(DEFAULT_ROUTE_COOLDOWN_HOURS))
   .action(async (rawOptions: Record<string, string | undefined>) => {
     try {
       const options: RunOptions = {
@@ -579,7 +715,17 @@ program
         minHodlmmScore: toNumber(rawOptions.minHodlmmScore),
         minHodlmmVolumeUsd: toNumber(rawOptions.minHodlmmVolumeUsd),
         minHodlmmTvlUsd: toNumber(rawOptions.minHodlmmTvlUsd),
+        routeCooldownHours: toNumber(rawOptions.routeCooldownHours),
       };
+      if (options.reserveSats < 0 || options.maxRouteSats < 0) {
+        printFlatError("reserve-sats and max-route-sats must be non-negative");
+      }
+      if (options.minHodlmmScore < 0 || options.minHodlmmVolumeUsd < 0 || options.minHodlmmTvlUsd < 0) {
+        printFlatError("HODLMM thresholds must be non-negative");
+      }
+      if (options.routeCooldownHours < 0) {
+        printFlatError("route-cooldown-hours must be non-negative");
+      }
       await runStatus(options);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -595,6 +741,7 @@ program
   .option("--min-hodlmm-score <score>", "Minimum HODLMM momentum score", String(DEFAULT_MIN_HODLMM_SCORE))
   .option("--min-hodlmm-volume-usd <usd>", "Minimum HODLMM 24h volume", String(DEFAULT_MIN_HODLMM_VOLUME_USD))
   .option("--min-hodlmm-tvl-usd <usd>", "Minimum HODLMM TVL", String(DEFAULT_MIN_HODLMM_TVL_USD))
+  .option("--route-cooldown-hours <hours>", "Minimum hours between active route changes", String(DEFAULT_ROUTE_COOLDOWN_HOURS))
   .action(async (rawOptions: Record<string, string | undefined>) => {
     try {
       const options: RunOptions = {
@@ -603,6 +750,7 @@ program
         minHodlmmScore: toNumber(rawOptions.minHodlmmScore),
         minHodlmmVolumeUsd: toNumber(rawOptions.minHodlmmVolumeUsd),
         minHodlmmTvlUsd: toNumber(rawOptions.minHodlmmTvlUsd),
+        routeCooldownHours: toNumber(rawOptions.routeCooldownHours),
       };
 
       if (options.reserveSats < 0 || options.maxRouteSats < 0) {
@@ -610,6 +758,9 @@ program
       }
       if (options.minHodlmmScore < 0 || options.minHodlmmVolumeUsd < 0 || options.minHodlmmTvlUsd < 0) {
         printFlatError("HODLMM thresholds must be non-negative");
+      }
+      if (options.routeCooldownHours < 0) {
+        printFlatError("route-cooldown-hours must be non-negative");
       }
 
       await runRouter(options);

@@ -14,7 +14,7 @@ metadata:
 # sBTC Yield Router
 
 ## What it does
-Reads the active AIBTC wallet, keeps a configurable sBTC operating reserve, and routes only excess sBTC into the best current destination: Bitflow HODLMM when fee and volume momentum are strong, Zest when Bitflow timing is weak but idle capital should still earn, or hold when safety gates fail.
+Reads the active AIBTC wallet, keeps a configurable sBTC operating reserve, and routes only excess sBTC into the best current destination: Bitflow HODLMM when fee and volume momentum are strong, Zest when Bitflow timing is weak but idle capital should still earn, or hold when safety gates fail. It also records local route history and enforces a cooldown between active route changes to reduce churn.
 
 ## Why agents need it
 Agents need a direct capital decision, not just isolated monitors. This skill answers the practical question: "I have idle sBTC now. Should I hold it, lend it on Zest, or deploy it to Bitflow HODLMM?" It is the routing layer between wallet balances, HODLMM timing, and conservative yield fallback.
@@ -25,6 +25,7 @@ Agents need a direct capital decision, not just isolated monitors. This skill an
 - Wallet-aware. By default it resolves the active AIBTC wallet locally.
 - Enforces a configurable liquid reserve floor before recommending any routing action.
 - Caps any routed amount and never recommends draining the wallet to zero.
+- Tracks local route history and can block rapid route changes with a cooldown unless a stronger HODLMM spike appears.
 
 ## Commands
 
@@ -48,7 +49,7 @@ bun run skills/sbtc-yield-router/sbtc-yield-router.ts run
 
 Optional flags:
 ```bash
-bun run skills/sbtc-yield-router/sbtc-yield-router.ts run --reserve-sats 200000 --max-route-sats 500000 --min-hodlmm-score 120 --min-hodlmm-volume-usd 25000 --min-hodlmm-tvl-usd 25000
+bun run skills/sbtc-yield-router/sbtc-yield-router.ts run --reserve-sats 200000 --max-route-sats 500000 --min-hodlmm-score 120 --min-hodlmm-volume-usd 25000 --min-hodlmm-tvl-usd 25000 --route-cooldown-hours 4
 ```
 
 ## Output contract
@@ -100,4 +101,5 @@ All outputs are JSON to stdout.
 - Requires local AIBTC wallet metadata to resolve the default active address.
 - Uses Bitflow public app APIs for live HODLMM fee, volume, APR, and liquidity signals.
 - Zest readiness is validated by contract reachability rather than a live public APR feed.
+- Persists local route history in `~/.sbtc-yield-router-state.json` for trend and cooldown handling.
 - Routing output is advisory only; any actual Zest supply or HODLMM deployment must happen in a separate writer skill.
