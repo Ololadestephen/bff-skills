@@ -106,6 +106,40 @@ function toBigInt(value: string | number | bigint | undefined | null): bigint {
   return 0n;
 }
 
+function parseBigIntOption(
+  value: string | undefined,
+  fallback: bigint,
+  flag: string
+): bigint {
+  if (value === undefined) return fallback;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    printFlatError(`${flag} must not be empty`);
+  }
+  try {
+    return BigInt(trimmed);
+  } catch {
+    printFlatError(`${flag} must be an integer value`);
+  }
+}
+
+function parseNumberOption(
+  value: string | undefined,
+  fallback: number,
+  flag: string
+): number {
+  if (value === undefined) return fallback;
+  const trimmed = value.trim();
+  if (trimmed.length === 0) {
+    printFlatError(`${flag} must not be empty`);
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) {
+    printFlatError(`${flag} must be a numeric value`);
+  }
+  return parsed;
+}
+
 async function fetchJson<T>(url: string): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
@@ -435,12 +469,16 @@ function parseOptions(rawOptions: Record<string, string | undefined>): RunOption
   const confirm = rawOptions.confirm;
   const parsed: RunOptions = {
     walletId,
-    targetAbtcSats: toBigInt(targetAbtcSats || String(DEFAULT_TARGET_ABTC_SATS)),
-    swapAmountUstx: toBigInt(swapAmountUstx || String(DEFAULT_SWAP_AMOUNT_USTX)),
-    maxSwapUstx: toBigInt(maxSwapUstx || String(DEFAULT_MAX_SWAP_USTX)),
-    minGasReserveUstx: toBigInt(minGasReserveUstx || String(DEFAULT_MIN_GAS_RESERVE_USTX)),
-    slippageBps: toNumber(slippageBps || String(DEFAULT_SLIPPAGE_BPS)),
-    minReceiveSats: toBigInt(minReceiveSats || String(DEFAULT_MIN_RECEIVE_SATS)),
+    targetAbtcSats: parseBigIntOption(targetAbtcSats, BigInt(DEFAULT_TARGET_ABTC_SATS), "target-abtc-sats"),
+    swapAmountUstx: parseBigIntOption(swapAmountUstx, BigInt(DEFAULT_SWAP_AMOUNT_USTX), "swap-amount-ustx"),
+    maxSwapUstx: parseBigIntOption(maxSwapUstx, BigInt(DEFAULT_MAX_SWAP_USTX), "max-swap-ustx"),
+    minGasReserveUstx: parseBigIntOption(
+      minGasReserveUstx,
+      BigInt(DEFAULT_MIN_GAS_RESERVE_USTX),
+      "min-gas-reserve-ustx"
+    ),
+    slippageBps: parseNumberOption(slippageBps, DEFAULT_SLIPPAGE_BPS, "slippage-bps"),
+    minReceiveSats: parseBigIntOption(minReceiveSats, BigInt(DEFAULT_MIN_RECEIVE_SATS), "min-receive-sats"),
     confirm,
   };
 
