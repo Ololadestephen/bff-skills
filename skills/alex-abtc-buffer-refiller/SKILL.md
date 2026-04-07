@@ -58,10 +58,10 @@ AIBTC_WALLET_PASSWORD='your-password' bun run skills/alex-abtc-buffer-refiller/a
 Example tuned run:
 
 ```bash
-AIBTC_WALLET_PASSWORD='your-password' bun run skills/alex-abtc-buffer-refiller/alex-abtc-buffer-refiller.ts run --wallet-id=3fd5fe55-40dd-4a19-b3dd-f71e31ed0b8d --target-abtc-sats=25 --swap-amount-ustx=500000 --max-swap-ustx=500000 --min-gas-reserve-ustx=100000 --slippage-bps=500 --confirm=REFILL
+AIBTC_WALLET_PASSWORD='your-password' bun run skills/alex-abtc-buffer-refiller/alex-abtc-buffer-refiller.ts run --wallet-id=3fd5fe55-40dd-4a19-b3dd-f71e31ed0b8d --target-abtc-sats=25 --swap-amount-ustx=500000 --max-swap-ustx=500000 --min-gas-reserve-ustx=100000 --slippage-bps=200 --confirm=REFILL
 ```
 
-The default `--slippage-bps=500` uses a 5% floor to keep very small refill swaps viable even when liquidity is thin. For larger swaps or tighter execution requirements, prefer overriding with a lower value such as `--slippage-bps=100` or `--slippage-bps=200`.
+The default `--slippage-bps=200` uses a 2% floor as the safer baseline for production swaps. For very small swaps in thinner liquidity, agents can explicitly loosen this with values like `--slippage-bps=300` or `--slippage-bps=500` when justified by the live quote.
 
 ## Output contract
 
