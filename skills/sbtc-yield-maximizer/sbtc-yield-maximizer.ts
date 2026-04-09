@@ -18,7 +18,7 @@ const SBTC_CONTRACT = "SM3VDXK3WZZSA84XXFKAFAF15NNZX32CTSG82JFQ4.sbtc-token";
 const ZEST_SBTC_VAULT = "SP1A27KFY4XERQCCRCARCYD1CC5N7M6688BSYADJ7.v0-vault-sbtc";
 const FETCH_TIMEOUT_MS = 30_000;
 const PRICE_SCALE = 1e8;
-const DEFAULT_MAX_DEPLOY_SATS = 100n;
+const DEFAULT_MAX_DEPLOY_SATS = 10_000n;
 const DEFAULT_RESERVE_SATS = 100n;
 const DEFAULT_MIN_GAS_RESERVE_USTX = 100_000n;
 const DEFAULT_MIN_HODLMM_VOLUME_USD = 250;
@@ -166,6 +166,12 @@ interface Context {
   blockers: string[];
   zestPosition: Record<string, unknown> | null;
 }
+
+const REQUIRED_PACKS = [
+  "@aibtc/mcp-server",
+  "@stacks/transactions",
+  "commander",
+] as const;
 
 function serializeZestSignal(signal: ZestSignal): Record<string, unknown> {
   return {
@@ -317,6 +323,9 @@ async function getZestSignal(senderAddress: string): Promise<ZestSignal> {
     readUint("get-total-assets"),
     readUint("get-total-supply"),
   ]);
+  // Verified against the live v0-vault-sbtc source:
+  // the contract defines `BPS u10000` and applies interest math in basis points,
+  // so `get-interest-rate` already returns a bps-style integer.
   const inferredApyBps = Number(rawInterestRate);
   return {
     rawInterestRate,
@@ -496,6 +505,18 @@ async function runDoctor(options: RunOptions): Promise<void> {
   });
 }
 
+async function runInstallPacks(): Promise<void> {
+  printResult({
+    status: "success",
+    action: "Required runtime packages listed for sbtc-yield-maximizer.",
+    data: {
+      packages: REQUIRED_PACKS,
+      note: "This skill expects these packages to be available in the execution environment.",
+    },
+    error: null,
+  });
+}
+
 async function runStatus(options: RunOptions): Promise<void> {
   const context = await collectContext(options);
   const actionMap: Record<RouteName, string> = {
@@ -666,7 +687,7 @@ program
   .description("Write skill for routing idle sBTC to the highest safe current yield path")
   .showHelpAfterError();
 
-for (const command of ["doctor", "status", "run"]) {
+for (const command of ["doctor", "install-packs", "status", "run"]) {
   program
     .command(command)
     .option("--wallet-id <id>", "Specific AIBTC wallet id to use")
@@ -680,6 +701,7 @@ for (const command of ["doctor", "status", "run"]) {
     .option("--cooldown-hours <hours>", "Cooldown window between write executions", String(DEFAULT_COOLDOWN_HOURS))
     .option("--confirm <token>", "Required only for run: set to MAXIMIZE to allow broadcast")
     .action(async (rawOptions) => {
+      if (command === "install-packs") return runInstallPacks();
       const options = parseOptions(rawOptions as Record<string, string | undefined>);
       if (command === "doctor") return runDoctor(options);
       if (command === "status") return runStatus(options);

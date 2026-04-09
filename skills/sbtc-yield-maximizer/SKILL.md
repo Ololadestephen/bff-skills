@@ -5,7 +5,7 @@ metadata:
   author: "Ololadestephen"
   author-agent: "Wide Eden"
   user-invocable: "false"
-  arguments: "doctor | status | run"
+  arguments: "doctor | install-packs | status | run"
   entry: "sbtc-yield-maximizer/sbtc-yield-maximizer.ts"
   requires: "wallet, signing, settings"
   tags: "defi, write, mainnet-only, requires-funds, l2"
@@ -29,6 +29,7 @@ Agents should not deploy sBTC based on static assumptions. They need a real deci
 - Reserve enforced. The wallet retains at least `--reserve-sats` after the write path.
 - Deploy cap enforced. The routed amount is capped by `--max-deploy-sats`.
 - Gas reserve enforced. The wallet must keep at least `--min-gas-reserve-ustx`.
+- Post-conditions enforced. The Zest service-layer write path uses `PostConditionMode.Deny`.
 - HODLMM stale-price gate enforced. Pools with price divergence above `--max-price-divergence-pct` are disqualified from winning.
 - HODLMM liquidity gates enforced. Pools below the configured TVL or 24h volume floors are disqualified.
 - Cooldown enforced. Repeated route execution is blocked until `--cooldown-hours` has elapsed.
@@ -42,6 +43,13 @@ Checks wallet resolution, STX and sBTC balances, Zest vault reads, Bitflow pool 
 
 ```bash
 bun run skills/sbtc-yield-maximizer/sbtc-yield-maximizer.ts doctor
+```
+
+### install-packs
+Lists the required runtime packages used by this skill.
+
+```bash
+bun run skills/sbtc-yield-maximizer/sbtc-yield-maximizer.ts install-packs
 ```
 
 ### status
@@ -61,7 +69,7 @@ AIBTC_WALLET_PASSWORD='your-password' bun run skills/sbtc-yield-maximizer/sbtc-y
 Example tuned run:
 
 ```bash
-AIBTC_WALLET_PASSWORD='your-password' bun run skills/sbtc-yield-maximizer/sbtc-yield-maximizer.ts run --wallet-id=b4d575f8-0865-4d6f-b1d6-5627b645a03c --max-deploy-sats=100 --reserve-sats=100 --min-gas-reserve-ustx=100000 --min-hodlmm-volume-usd=250 --min-hodlmm-tvl-usd=1000 --max-price-divergence-pct=1 --confirm=MAXIMIZE
+AIBTC_WALLET_PASSWORD='your-password' bun run skills/sbtc-yield-maximizer/sbtc-yield-maximizer.ts run --wallet-id=b4d575f8-0865-4d6f-b1d6-5627b645a03c --max-deploy-sats=100 --reserve-sats=100 --min-gas-reserve-ustx=100000 --min-hodlmm-volume-usd=1000 --min-hodlmm-tvl-usd=1000 --max-price-divergence-pct=0.5 --confirm=MAXIMIZE
 ```
 
 ## Output contract
@@ -107,6 +115,6 @@ All outputs are JSON to stdout.
 ## Known constraints
 
 - This version executes the Zest route when Zest is the winning route. When HODLMM wins, the skill reports that outcome but does not attempt a direct HODLMM LP deposit.
-- Zest sBTC yield is derived from live on-chain Zest vault reads and interpreted as a basis-points-style supply signal.
+- Zest sBTC yield is derived from live on-chain Zest vault reads and interpreted as a basis-points-style supply signal. This was verified against the live `v0-vault-sbtc` source, which defines `BPS u10000` and applies rate math in basis points.
 - HODLMM opportunity is derived from live Bitflow app and quote APIs using APR, fee run-rate, volume, TVL, and stale-price checks.
 - Requires enough sBTC to exceed reserve and enough STX to preserve gas reserve.

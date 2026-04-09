@@ -34,11 +34,6 @@ Use this skill to deploy idle sBTC only when the highest safe live yield route i
 - Never claim the HODLMM path is executable in this skill version.
 - Never execute when Zest is not the winning route.
 - Never execute when STX reserve would fall below `--min-gas-reserve-ustx`.
-
-## Refusal conditions
-
-Refuse to execute when any of the following is true:
-
 - no AIBTC wallet can be resolved
 - the wallet is not on mainnet
 - no idle sBTC is available above reserve
@@ -47,6 +42,7 @@ Refuse to execute when any of the following is true:
 - HODLMM wins but direct HODLMM deposit is not enabled in this version
 - operator confirmation is missing
 - wallet unlock fails
+- Treat the Zest service-layer call as post-condition protected. Execution assumes the underlying service uses `PostConditionMode.Deny`.
 
 ## Operational notes
 
