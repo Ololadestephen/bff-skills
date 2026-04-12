@@ -28,7 +28,8 @@ const DEFAULT_SLIPPAGE_BPS = 300;
 const DEFAULT_MIN_RECEIVE_BASE = 1n;
 const DEFAULT_COOLDOWN_HOURS = 4;
 const CONFIRM_TOKEN = "REDUCE";
-const STATE_FILE = join(homedir(), ".hodlmm-position-reducer-state.json");
+const STATE_DIR = join(homedir(), ".aibtc");
+const MAX_CANDIDATE_POOLS = 3;
 
 type SkillStatus = "success" | "error" | "blocked";
 
@@ -179,6 +180,7 @@ interface Context {
   minAmountOutBase: bigint;
   canReduce: boolean;
   blockers: string[];
+  stateFile: string;
 }
 
 function printFlatError(message: string): never {
@@ -316,9 +318,13 @@ async function fetchBins(poolId: string): Promise<BinRecord[]> {
   return data.bins || [];
 }
 
-async function readState(): Promise<ReducerState> {
+function getStateFilePath(walletId: string): string {
+  return join(STATE_DIR, `hodlmm-position-reducer-${walletId}.json`);
+}
+
+async function readState(walletId: string): Promise<ReducerState> {
   try {
-    const file = Bun.file(STATE_FILE);
+    const file = Bun.file(getStateFilePath(walletId));
     if (!(await file.exists())) {
       return {};
     }
@@ -328,12 +334,12 @@ async function readState(): Promise<ReducerState> {
   }
 }
 
-async function writeState(state: ReducerState): Promise<void> {
-  await Bun.write(STATE_FILE, JSON.stringify(state, null, 2));
+async function writeState(walletId: string, state: ReducerState): Promise<void> {
+  await Bun.write(getStateFilePath(walletId), JSON.stringify(state, null, 2));
 }
 
-async function checkCooldown(cooldownHours: number): Promise<CooldownResult> {
-  const state = await readState();
+async function checkCooldown(walletId: string, cooldownHours: number): Promise<CooldownResult> {
+  const state = await readState(walletId);
   if (!state.lastReductionAt) {
     return { ok: true, remainingHours: 0, lastReductionAt: null };
   }
@@ -430,12 +436,18 @@ function computePoolAssessment(quotePool: QuotePool, appPool: AppPool, bins: Bin
 async function assessPools(poolId?: string): Promise<AssessedPool[]> {
   const [quotePools, appPools] = await Promise.all([fetchQuotePools(), fetchAppPools()]);
   const appPoolMap = new Map(appPools.map((pool) => [pool.poolId, pool]));
-  const candidates = poolId ? quotePools.filter((pool) => pool.pool_id === poolId) : quotePools;
+  const candidates = (poolId ? quotePools.filter((pool) => pool.pool_id === poolId) : quotePools)
+    .map((quotePool) => {
+      const appPool = appPoolMap.get(quotePool.pool_id) || appPoolMap.get(quotePool.pool_id.replace("dlmm_2", "dlmm_1"));
+      return appPool ? { quotePool, appPool } : null;
+    })
+    .filter((entry): entry is { quotePool: QuotePool; appPool: AppPool } => Boolean(entry))
+    // Bound the bins fan-out to the strongest pools first so status calls stay predictable.
+    .sort((a, b) => (b.appPool.tvlUsd + b.appPool.volumeUsd1d) - (a.appPool.tvlUsd + a.appPool.volumeUsd1d))
+    .slice(0, poolId ? 1 : MAX_CANDIDATE_POOLS);
 
   const assessed = await Promise.all(
-    candidates.map(async (quotePool) => {
-      const appPool = appPoolMap.get(quotePool.pool_id) || appPoolMap.get(quotePool.pool_id.replace("dlmm_2", "dlmm_1"));
-      if (!appPool) return null;
+    candidates.map(async ({ quotePool, appPool }) => {
       const bins = await fetchBins(quotePool.pool_id);
       return computePoolAssessment(quotePool, appPool, bins);
     })
@@ -471,11 +483,12 @@ function computeMinAmountOutBase(expectedAmountOut: string, slippageBps: number)
 async function collectContext(options: RunOptions): Promise<Context> {
   process.env.BITFLOW_API_HOST ||= BITFLOW_PUBLIC_HOST;
   const wallet = await resolveWallet(options.walletId);
+  const stateFile = getStateFilePath(wallet.id);
   const [stxUstx, sbtcSats, candidatePools, cooldown] = await Promise.all([
     getStxBalance(wallet.address),
     getSbtcBalance(wallet.address),
     assessPools(options.poolId),
-    checkCooldown(options.cooldownHours),
+    checkCooldown(wallet.id, options.cooldownHours),
   ]);
   const highestRiskPool = candidatePools[0] || null;
   const topPool =
@@ -538,6 +551,7 @@ async function collectContext(options: RunOptions): Promise<Context> {
     minAmountOutBase,
     canReduce: blockers.length === 0,
     blockers,
+    stateFile,
   };
 }
 
@@ -570,6 +584,10 @@ async function runDoctor(options: RunOptions): Promise<void> {
       detail: context.quote
         ? `${context.reduceSats.toString()} sats -> ${context.quote.expectedAmountOut} USDCx`
         : "No quote available",
+    };
+    checks.state_file = {
+      ok: true,
+      detail: context.stateFile,
     };
     checks.password_env = {
       ok: Boolean(process.env.AIBTC_WALLET_PASSWORD),
@@ -629,6 +647,7 @@ async function runStatus(options: RunOptions): Promise<void> {
         minGasReserveUstx: options.minGasReserveUstx.toString(),
       },
       cooldown: context.cooldown,
+      stateFile: context.stateFile,
       highestRiskPool: context.highestRiskPool,
       topPool: context.topPool,
       candidates: context.candidatePools,
@@ -710,7 +729,7 @@ async function runReduce(options: RunOptions): Promise<void> {
       slippageTolerance
     );
 
-    await writeState({
+    await writeState(context.wallet.id, {
       lastReductionAt: new Date().toISOString(),
       lastTxid: result.txid,
       lastPoolId: context.topPool.poolId,
@@ -737,7 +756,7 @@ async function runReduce(options: RunOptions): Promise<void> {
         },
         txid: result.txid,
         explorerUrl: getExplorerTxUrl(result.txid, NETWORK),
-        stateFile: STATE_FILE,
+        stateFile: context.stateFile,
       },
       error: null,
     });
@@ -766,20 +785,20 @@ async function runReduce(options: RunOptions): Promise<void> {
 
 function parseOptions(rawOptions: Record<string, string | undefined>): RunOptions {
   const parsed: RunOptions = {
-    walletId: rawOptions.walletId || rawOptions["wallet-id"],
-    poolId: rawOptions.poolId || rawOptions["pool-id"],
-    maxReduceSats: parseBigIntOption(rawOptions.maxReduceSats || rawOptions["max-reduce-sats"], DEFAULT_MAX_REDUCE_SATS, "max-reduce-sats"),
-    reserveSats: parseBigIntOption(rawOptions.reserveSats || rawOptions["reserve-sats"], DEFAULT_RESERVE_SATS, "reserve-sats"),
-    triggerRiskScore: parseNumberOption(rawOptions.triggerRiskScore || rawOptions["trigger-risk-score"], DEFAULT_TRIGGER_RISK_SCORE, "trigger-risk-score"),
-    minVolumeUsd: parseNumberOption(rawOptions.minVolumeUsd || rawOptions["min-volume-usd"], DEFAULT_MIN_VOLUME_USD, "min-volume-usd"),
+    walletId: rawOptions.walletId,
+    poolId: rawOptions.poolId,
+    maxReduceSats: parseBigIntOption(rawOptions.maxReduceSats, DEFAULT_MAX_REDUCE_SATS, "max-reduce-sats"),
+    reserveSats: parseBigIntOption(rawOptions.reserveSats, DEFAULT_RESERVE_SATS, "reserve-sats"),
+    triggerRiskScore: parseNumberOption(rawOptions.triggerRiskScore, DEFAULT_TRIGGER_RISK_SCORE, "trigger-risk-score"),
+    minVolumeUsd: parseNumberOption(rawOptions.minVolumeUsd, DEFAULT_MIN_VOLUME_USD, "min-volume-usd"),
     minGasReserveUstx: parseBigIntOption(
-      rawOptions.minGasReserveUstx || rawOptions["min-gas-reserve-ustx"],
+      rawOptions.minGasReserveUstx,
       DEFAULT_MIN_GAS_RESERVE_USTX,
       "min-gas-reserve-ustx"
     ),
-    slippageBps: parseNumberOption(rawOptions.slippageBps || rawOptions["slippage-bps"], DEFAULT_SLIPPAGE_BPS, "slippage-bps"),
-    minReceiveBase: parseBigIntOption(rawOptions.minReceiveBase || rawOptions["min-receive-base"], DEFAULT_MIN_RECEIVE_BASE, "min-receive-base"),
-    cooldownHours: parseNumberOption(rawOptions.cooldownHours || rawOptions["cooldown-hours"], DEFAULT_COOLDOWN_HOURS, "cooldown-hours"),
+    slippageBps: parseNumberOption(rawOptions.slippageBps, DEFAULT_SLIPPAGE_BPS, "slippage-bps"),
+    minReceiveBase: parseBigIntOption(rawOptions.minReceiveBase, DEFAULT_MIN_RECEIVE_BASE, "min-receive-base"),
+    cooldownHours: parseNumberOption(rawOptions.cooldownHours, DEFAULT_COOLDOWN_HOURS, "cooldown-hours"),
     confirm: rawOptions.confirm,
   };
 
@@ -835,6 +854,21 @@ for (const command of ["doctor", "status", "run"]) {
       await runReduce(options);
     });
 }
+
+program
+  .command("install-packs")
+  .description("List the required runtime packages for this skill")
+  .action(() => {
+    printResult({
+      status: "success",
+      action: "Required runtime packages listed for hodlmm-position-reducer.",
+      data: {
+        packages: ["@aibtc/mcp-server", "commander"],
+        note: "This skill expects these packages to be available in the execution environment.",
+      },
+      error: null,
+    });
+  });
 
 program.parseAsync(process.argv).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);

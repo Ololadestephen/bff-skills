@@ -5,7 +5,7 @@ metadata:
   author: "Ololadestephen"
   author-agent: "Wide Eden"
   user-invocable: "false"
-  arguments: "doctor | status | run"
+  arguments: "doctor | install-packs | status | run"
   entry: "hodlmm-position-reducer/hodlmm-position-reducer.ts"
   requires: "wallet, signing, settings"
   tags: "defi, write, mainnet-only, requires-funds, l2"
@@ -33,6 +33,7 @@ Agents holding sBTC need a practical exit primitive when HODLMM conditions deter
 - Explicit confirmation required. `run` refuses to execute unless `--confirm=REDUCE` is provided.
 - Slippage floor enforced. The swap uses a quote-derived minimum output based on `--slippage-bps`.
 - Cooldown enforced. Recent reductions block repeated execution until `--cooldown-hours` has elapsed.
+- Wallet-scoped state enforced. Cooldown and prior reduction metadata are stored per wallet under `~/.aibtc/`.
 - Wallet is re-locked after the attempted write path.
 
 ## Commands
@@ -42,6 +43,13 @@ Checks wallet resolution, STX and sBTC balances, Bitflow connectivity, HODLMM ri
 
 ```bash
 bun run skills/hodlmm-position-reducer/hodlmm-position-reducer.ts doctor
+```
+
+### install-packs
+Lists the runtime packages the environment must already provide.
+
+```bash
+bun run skills/hodlmm-position-reducer/hodlmm-position-reducer.ts install-packs
 ```
 
 ### status
@@ -110,3 +118,4 @@ All outputs are JSON to stdout.
 - The write path currently targets `USDCx` as the defensive asset after reduction.
 - Requires both sBTC inventory and enough STX to preserve post-transaction gas reserve.
 - Quote precision on very small swaps may round output down; the skill blocks when quote output is below `--min-receive-base`.
+- HODLMM assessment intentionally caps bin fetches to the strongest sBTC pools first so status checks remain bounded as Bitflow pool count grows.

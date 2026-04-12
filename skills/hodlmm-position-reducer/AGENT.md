@@ -35,19 +35,14 @@ Use this skill to reduce sBTC exposure when Bitflow sBTC HODLMM pools show eleva
 - Never execute when `volumeUsd1d` is below `--min-volume-usd`.
 - Never execute when the quote output is below `--min-receive-base`.
 - Never execute when STX reserve would fall below `--min-gas-reserve-ustx`.
-
-## Refusal conditions
-
-Refuse to execute when any of the following is true:
-
-- no AIBTC wallet can be resolved
-- the wallet is not on mainnet
-- no sBTC balance is available above reserve
-- no eligible sBTC HODLMM pool can be assessed
-- the risk trigger is not met
-- cooldown is active
-- the quote is zero or below the receive floor
-- operator confirmation is missing
+- Refuse when no AIBTC wallet can be resolved.
+- Refuse when the wallet is not on mainnet.
+- Refuse when no sBTC balance is available above reserve.
+- Refuse when no eligible sBTC HODLMM pool can be assessed.
+- Refuse when the risk trigger is not met.
+- Refuse when cooldown is active.
+- Refuse when the quote is zero or below the receive floor.
+- Refuse when operator confirmation is missing.
 
 ## Operational notes
 
