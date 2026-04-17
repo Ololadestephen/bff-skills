@@ -41,7 +41,7 @@ jobs:
           echo "skill_path=skills/$SKILL_DIR" >> "$GITHUB_OUTPUT"
           echo "Detected skill: $SKILL_DIR"
 
-      - name: Extract author from SKILL.md frontmatter
+      - name: Extract author and day label from PR
         id: author
         run: |
           SKILL_PATH="${{ steps.detect.outputs.skill_path }}"
@@ -55,16 +55,22 @@ jobs:
             AUTHOR_AGENT=$(grep -E '^\s*author_agent:' "$SKILL_PATH/SKILL.md" | head -1 | sed 's/.*author_agent:\s*//' | tr -d '"' | tr -d "'" | xargs)
           fi
 
+          # Extract "DAY X" label from PR labels (e.g., "DAY 5")
+          LABELS='${{ join(github.event.pull_request.labels.*.name, ',') }}'
+          DAY_LABEL=$(echo "$LABELS" | tr ',' '\n' | grep -iE '^DAY [0-9]+$' | head -1)
+
           echo "author=$AUTHOR" >> "$GITHUB_OUTPUT"
           echo "author_agent=$AUTHOR_AGENT" >> "$GITHUB_OUTPUT"
+          echo "day_label=$DAY_LABEL" >> "$GITHUB_OUTPUT"
           echo "PR author (GitHub): ${{ github.event.pull_request.user.login }}"
           echo "Skill author (frontmatter): $AUTHOR"
           echo "Agent name: $AUTHOR_AGENT"
+          echo "Day label: $DAY_LABEL"
 
       - name: Convert frontmatter to AIBTC format
         run: |
           SKILL_PATH="${{ steps.detect.outputs.skill_path }}"
-          node scripts/convert-frontmatter.js "$SKILL_PATH/SKILL.md"
+          node scripts/convert-frontmatter.js "$SKILL_PATH/SKILL.md" || echo "::warning::Frontmatter conversion skipped or failed — file may already be in AIBTC format"
 
       - name: Fix command paths for aibtcdev repo
         run: |
@@ -127,6 +133,7 @@ jobs:
           SKILL_NAME="${{ steps.detect.outputs.skill_name }}"
           AUTHOR="${{ steps.author.outputs.author }}"
           AUTHOR_AGENT="${{ steps.author.outputs.author_agent }}"
+          DAY_LABEL="${{ steps.author.outputs.day_label }}"
           PR_NUMBER="${{ github.event.pull_request.number }}"
           PR_URL="${{ github.event.pull_request.html_url }}"
           PR_TITLE="${{ github.event.pull_request.title }}"
@@ -139,16 +146,31 @@ jobs:
           git config user.name "BFF Skills Bot"
           git config user.email "bff-skills-bot@bitflow.finance"
 
+          # Configure git to use GH_TOKEN for pushing to the fork
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${FORK_OWNER}/skills.git"
+
+          # Build day suffix for PR title (e.g., "Day 5" from label "DAY 5")
+          DAY_SUFFIX=""
+          if [ -n "$DAY_LABEL" ]; then
+            # Normalize "DAY 5" -> "Day 5"
+            DAY_NUM=$(echo "$DAY_LABEL" | grep -oE '[0-9]+')
+            DAY_SUFFIX=" Day ${DAY_NUM}"
+          fi
+
           git checkout -b "$BRANCH"
 
           git add "$SKILL_NAME/"
 
-          # Write commit message to file to avoid YAML multi-line issues
-          printf 'feat: add %s skill (BFF Skills Comp winner)\n\nSubmitted by @%s' "$SKILL_NAME" "$AUTHOR" > /tmp/commit-msg.txt
-          if [ -n "$AUTHOR_AGENT" ]; then
-            printf ' (%s)' "$AUTHOR_AGENT" >> /tmp/commit-msg.txt
-          fi
-          printf ' via the AIBTC x Bitflow Skills Pay the Bills competition.\n\nCompetition PR: %s\n' "$PR_URL" >> /tmp/commit-msg.txt
+          # Write commit message to file to avoid shell quoting issues
+          {
+            printf '%s\n' "feat: add ${SKILL_NAME} skill (BFF Skills Comp${DAY_SUFFIX} winner)"
+            printf '\n%s' "Submitted by @${AUTHOR}"
+            if [ -n "$AUTHOR_AGENT" ]; then
+              printf ' (%s)' "$AUTHOR_AGENT"
+            fi
+            printf ' via the AIBTC x Bitflow Skills Pay the Bills competition.\n'
+            printf '\n%s\n' "Competition PR: ${PR_URL}"
+          } > /tmp/commit-msg.txt
 
           git commit \
             --author="${AUTHOR} <${AUTHOR}@users.noreply.github.com>" \
@@ -156,27 +178,32 @@ jobs:
 
           git push origin "$BRANCH"
 
-          # Write PR body to file
-          printf '## %s\n\n' "$SKILL_NAME" > /tmp/pr-body.txt
-          printf '**Author:** @%s' "$AUTHOR" >> /tmp/pr-body.txt
-          if [ -n "$AUTHOR_AGENT" ]; then
-            printf ' (%s)' "$AUTHOR_AGENT" >> /tmp/pr-body.txt
-          fi
-          printf '\n**Competition PR:** %s\n' "$PR_URL" >> /tmp/pr-body.txt
-          printf '**PR Title:** %s\n\n---\n\n' "$PR_TITLE" >> /tmp/pr-body.txt
-          printf 'This skill was submitted to the [AIBTC x Bitflow Skills Pay the Bills](https://bff.army/agents.txt) competition, reviewed by judging agents and the human panel, and approved as a daily winner.\n\n' >> /tmp/pr-body.txt
-          printf 'Frontmatter has been converted to the aibtcdev/skills `metadata:` convention. Command paths updated to match this repo root-level skill layout.\n\n' >> /tmp/pr-body.txt
-          printf '### Files\n- `%s/SKILL.md` — Skill definition with AIBTC-format frontmatter\n' "$SKILL_NAME" >> /tmp/pr-body.txt
-          printf '- `%s/AGENT.md` — Agent behavior rules and guardrails\n' "$SKILL_NAME" >> /tmp/pr-body.txt
-          printf '- `%s/%s.ts` — TypeScript implementation\n\n' "$SKILL_NAME" "$SKILL_NAME" >> /tmp/pr-body.txt
-          printf '### Attribution\nOriginal author: **@%s**. The `metadata.author` field in SKILL.md preserves their attribution permanently.\n\n' "$AUTHOR" >> /tmp/pr-body.txt
-          printf '---\n_Automated by [BFF Skills Bot](https://github.com/BitflowFinance/bff-skills) on merge of PR #%s._\n' "$PR_NUMBER" >> /tmp/pr-body.txt
+          # Write PR body to file (using heredoc-style to avoid printf pitfalls)
+          {
+            printf '%s\n\n' "## ${SKILL_NAME}"
+            printf '%s' "**Author:** @${AUTHOR}"
+            if [ -n "$AUTHOR_AGENT" ]; then
+              printf ' (%s)' "$AUTHOR_AGENT"
+            fi
+            printf '\n%s\n' "**Competition PR:** ${PR_URL}"
+            printf '%s\n\n---\n\n' "**PR Title:** ${PR_TITLE}"
+            printf '%s\n\n' "This skill was submitted to the [AIBTC x Bitflow Skills Pay the Bills](https://bff.army/agents.txt) competition, reviewed by judging agents and the human panel, and approved as a${DAY_SUFFIX} winner."
+            printf '%s\n\n' "Frontmatter has been converted to the aibtcdev/skills \`metadata:\` convention. Command paths updated to match this repo root-level skill layout."
+            printf '%s\n' "### Files"
+            printf '%s\n' "- \`${SKILL_NAME}/SKILL.md\` — Skill definition with AIBTC-format frontmatter"
+            printf '%s\n' "- \`${SKILL_NAME}/AGENT.md\` — Agent behavior rules and guardrails"
+            printf '%s\n\n' "- \`${SKILL_NAME}/${SKILL_NAME}.ts\` — TypeScript implementation"
+            printf '%s\n\n' "### Attribution"
+            printf '%s\n\n' "Original author: **@${AUTHOR}**. The \`metadata.author\` field in SKILL.md preserves their attribution permanently."
+            printf '%s\n' "---"
+            printf '%s\n' "_Automated by [BFF Skills Bot](https://github.com/BitflowFinance/bff-skills) on merge of PR #${PR_NUMBER}._"
+          } > /tmp/pr-body.txt
 
           gh pr create \
             --repo aibtcdev/skills \
             --base main \
             --head "${FORK_OWNER}:${BRANCH}" \
-            --title "feat: add ${SKILL_NAME} (BFF Skills Comp winner by @${AUTHOR})" \
+            --title "feat: add ${SKILL_NAME} (BFF Skills Comp${DAY_SUFFIX} winner by @${AUTHOR})" \
             --body-file /tmp/pr-body.txt
 
           echo "PR created to aibtcdev/skills via fork (${FORK_OWNER}/skills)"

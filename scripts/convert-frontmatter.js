@@ -54,6 +54,12 @@ if (!fmMatch) {
 const frontmatterRaw = fmMatch[1];
 const body = fmMatch[2];
 
+// Skip if already in AIBTC format (has nested metadata: block)
+if (/^\s*metadata:\s*$/m.test(frontmatterRaw)) {
+  console.log(`⏭️  Already in AIBTC format, skipping: ${path.basename(filePath)}`);
+  process.exit(0);
+}
+
 // Parse frontmatter lines into key-value pairs
 const fields = {};
 for (const line of frontmatterRaw.split('\n')) {
