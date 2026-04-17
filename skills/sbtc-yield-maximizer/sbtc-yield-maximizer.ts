@@ -31,7 +31,7 @@ const DEFAULT_MAX_DATA_AGE_SECONDS = 30;
 const DEFAULT_META_COOLDOWN_HOURS = 1;
 const DEFAULT_MEMPOOL_DEPTH_LIMIT = 0;
 const DEFAULT_HODLMM_SPREAD = 5;
-const MAX_HODLMM_POOLS = 3;
+const MAX_HODLMM_FALLBACK_POOLS = 3;
 const CONFIRM_TOKEN = "MAXIMIZE";
 const STATE_DIR = join(homedir(), ".aibtc");
 const HODLMM_EXTERNAL_COOLDOWN_HOURS = 4;
@@ -478,14 +478,20 @@ async function fetchHodlmmCandidates(options: RunOptions, walletAddress: string)
     (pool) => pool.tokens.tokenX.contract === SBTC_CONTRACT || pool.tokens.tokenY.contract === SBTC_CONTRACT
   );
   const appMap = new Map(appPools.map((pool) => [pool.poolId, pool]));
-  const strongestPools = quotePools
+  const matchedPools = quotePools
     .map((pool) => ({ quote: pool, app: appMap.get(pool.pool_id) || null }))
-    .filter((entry): entry is { quote: QuotePool; app: AppPool } => Boolean(entry.app))
-    .sort((a, b) => (b.app.tvlUsd + b.app.volumeUsd1d) - (a.app.tvlUsd + a.app.volumeUsd1d))
-    .slice(0, MAX_HODLMM_POOLS);
+    .filter((entry): entry is { quote: QuotePool; app: AppPool } => Boolean(entry.app));
+  const candidatePools = matchedPools.filter(
+    ({ app }) => app.volumeUsd1d >= options.minHodlmmVolumeUsd && app.tvlUsd >= options.minHodlmmTvlUsd
+  );
+  const poolsToEvaluate = candidatePools.length > 0
+    ? candidatePools
+    : matchedPools
+        .sort((a, b) => (b.app.tvlUsd + b.app.volumeUsd1d) - (a.app.tvlUsd + a.app.volumeUsd1d))
+        .slice(0, MAX_HODLMM_FALLBACK_POOLS);
 
   const candidates = await Promise.all(
-    strongestPools.map(async ({ quote, app }): Promise<HodlmmCandidate | null> => {
+    poolsToEvaluate.map(async ({ quote, app }): Promise<HodlmmCandidate | null> => {
       const fetchedAt = new Date().toISOString();
       const [binsData, userBins] = await Promise.all([
         fetchJson<BinsResponse>(`${BITFLOW_BINS_API}/${quote.pool_id}`),
