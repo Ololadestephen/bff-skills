@@ -25,7 +25,7 @@ Use this skill to deploy or reposition sBTC only when the highest safe live yiel
    - explicit operator approval has been given
 4. If Zest wins, execute the Zest write path.
 5. If HODLMM wins, call `hodlmm-move-liquidity run` via CLI rather than importing its source.
-6. Respect `hodlmm-move-liquidity`'s per-pool cooldown and treat its dry-run output as the HODLMM preflight check.
+6. Use `hodlmm-move-liquidity scan` as the no-broadcast HODLMM preflight check, then respect `hodlmm-move-liquidity`'s per-pool cooldown before delegated execution.
 7. Serialize writes so only one leg is active at a time.
 8. Require `--confirm=MAXIMIZE` before broadcasting.
 9. Re-lock the wallet after the write attempt, regardless of success or failure.
@@ -41,6 +41,7 @@ Use this skill to deploy or reposition sBTC only when the highest safe live yiel
 - Never let a route win when its APY data is stale.
 - Never rotate when the winning APY edge is below `--min-apy-diff-bps`.
 - Never bypass `hodlmm-move-liquidity` for the HODLMM write path.
+- Never expose the wallet password through subprocess CLI arguments.
 - Never execute when STX reserve would fall below `--min-gas-reserve-ustx`.
 - Refuse when no AIBTC wallet can be resolved.
 - Refuse when the wallet is not on mainnet.

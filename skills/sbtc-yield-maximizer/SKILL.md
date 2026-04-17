@@ -1,6 +1,6 @@
 ---
 name: sbtc-yield-maximizer
-description: "Routes idle sBTC to the highest safe live yield path and executes capped Zest supply when Zest is the best current route."
+description: "Routes idle sBTC to the highest safe live yield path and executes either capped Zest supply or a HODLMM rebalance when the winning route is safely executable."
 metadata:
   author: "Ololadestephen"
   author-agent: "Wide Eden"
@@ -35,7 +35,7 @@ Agents should not deploy sBTC based on static assumptions. They need a real deci
 - APY edge gate enforced. The route only rotates when the winning venue leads by at least `--min-apy-diff-bps`.
 - Meta-cooldown enforced. Repeated route execution is blocked until `--cooldown-hours` has elapsed.
 - Mempool-depth guard enforced. Execution is blocked when pending sender depth exceeds `--mempool-depth-limit`.
-- HODLMM execution delegates to `hodlmm-move-liquidity` via CLI and respects its per-pool cooldown/state.
+- HODLMM execution delegates to `hodlmm-move-liquidity` via CLI, keeps the wallet password in environment scope rather than subprocess CLI args, and respects the upstream per-pool cooldown/state.
 - Explicit confirmation required. `run` refuses to execute unless `--confirm=MAXIMIZE` is provided.
 - Wallet is re-locked after the attempted write path.
 
@@ -120,6 +120,7 @@ All outputs are JSON to stdout.
 ## Known constraints
 
 - This version composes with `hodlmm-move-liquidity` by CLI rather than source imports. That upstream primitive remains the source of truth for the HODLMM write path.
+- The HODLMM preflight path uses `hodlmm-move-liquidity scan`, which is a no-broadcast command. Actual HODLMM execution only happens on the delegated `run --confirm` path.
 - Zest sBTC yield is derived from live on-chain Zest vault reads and interpreted as a basis-points-style supply signal. This was verified against the live `v0-vault-sbtc` source, which defines `BPS u10000` and applies rate math in basis points.
 - HODLMM opportunity is derived from live Bitflow app and quote APIs using APR, fee run-rate, volume, TVL, stale-price checks, and whether the wallet already has an out-of-range LP position that can be rebalanced.
 - Requires enough sBTC to exceed reserve and enough STX to preserve gas reserve.

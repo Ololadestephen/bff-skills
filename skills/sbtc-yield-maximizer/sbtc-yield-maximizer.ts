@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
 import { Command } from "commander";
-import { homedir } from "os";
-import { join } from "path";
-import { closeSync, openSync, unlinkSync } from "fs";
+import { homedir, tmpdir } from "os";
+import { extname, isAbsolute, join, resolve as resolvePath } from "path";
+import { closeSync, openSync, statSync, unlinkSync } from "fs";
 import { cvToJSON, hexToCV } from "@stacks/transactions";
 import { getWalletManager } from "@aibtc/mcp-server/dist/services/wallet-manager.js";
 import { getExplorerTxUrl } from "@aibtc/mcp-server/dist/config/networks.js";
@@ -34,6 +34,8 @@ const DEFAULT_HODLMM_SPREAD = 5;
 const MAX_HODLMM_POOLS = 3;
 const CONFIRM_TOKEN = "MAXIMIZE";
 const STATE_DIR = join(homedir(), ".aibtc");
+const HODLMM_EXTERNAL_COOLDOWN_HOURS = 4;
+const EXECUTION_LOCK_MAX_AGE_MS = 15 * 60_000;
 const HODLMM_MOVE_STATE_CANDIDATES = [
   join(STATE_DIR, "hodlmm-move-liquidity-state.json"),
   join(homedir(), ".hodlmm-move-liquidity-state.json"),
@@ -224,6 +226,13 @@ interface ExternalCommandResult {
   action?: string;
   error?: string | null;
   data?: Record<string, unknown>;
+}
+
+interface HodlmmScanPosition {
+  pool_id?: string;
+  poolId?: string;
+  in_range?: boolean;
+  inRange?: boolean;
 }
 
 const REQUIRED_PACKS = [
@@ -615,7 +624,7 @@ async function readExternalCooldown(poolId: string): Promise<{ active: boolean; 
       const entry = state[poolId];
       if (!entry) return { active: false, remainingHours: 0, stateFile };
       const elapsedHours = (Date.now() - new Date(entry.last_move_at).getTime()) / 3_600_000;
-      const remainingHours = Math.max(0, 4 - elapsedHours);
+      const remainingHours = Math.max(0, HODLMM_EXTERNAL_COOLDOWN_HOURS - elapsedHours);
       return { active: remainingHours > 0, remainingHours: Number(remainingHours.toFixed(2)), stateFile };
     } catch {
       continue;
@@ -624,8 +633,14 @@ async function readExternalCooldown(poolId: string): Promise<{ active: boolean; 
   return { active: false, remainingHours: 0, stateFile: null };
 }
 
-function acquireNonceLock(walletId: string): () => void {
+function acquireExecutionLock(walletId: string): () => void {
   const lockFile = getLockFile(walletId);
+  const existing = statSync(lockFile, { throwIfNoEntry: false });
+  if (existing && Date.now() - existing.mtimeMs > EXECUTION_LOCK_MAX_AGE_MS) {
+    try {
+      unlinkSync(lockFile);
+    } catch {}
+  }
   const fd = openSync(lockFile, "wx");
   return () => {
     try {
@@ -643,6 +658,19 @@ function resolveHodlmmCommand(): string[] {
   const direct = Bun.which("hodlmm-move-liquidity");
   if (direct) return [direct];
   throw new Error("HODLMM_MOVE_LIQUIDITY_CMD is not set and hodlmm-move-liquidity is not installed in PATH");
+}
+
+function resolveHodlmmScriptTarget(command: string[]): string | null {
+  let candidate: string | null = null;
+  if (command[0] === "bun" && command[1] === "run" && command[2]) {
+    candidate = command[2];
+  } else if (command.length === 1) {
+    candidate = command[0];
+  }
+  if (!candidate) return null;
+  const resolved = isAbsolute(candidate) ? candidate : resolvePath(process.cwd(), candidate);
+  const extension = extname(resolved).toLowerCase();
+  return [".ts", ".tsx", ".js", ".mjs", ".cjs"].includes(extension) ? resolved : null;
 }
 
 async function runExternalJsonCommand(command: string[], args: string[], extraEnv: Record<string, string> = {}): Promise<ExternalCommandResult> {
@@ -670,19 +698,61 @@ async function runExternalJsonCommand(command: string[], args: string[], extraEn
   return parsed;
 }
 
+async function runHodlmmJsonCommand(
+  command: string[],
+  args: string[],
+  extraEnv: Record<string, string> = {},
+  requirePasswordBridge = false
+): Promise<ExternalCommandResult> {
+  const scriptTarget = resolveHodlmmScriptTarget(command);
+  if (!scriptTarget) {
+    if (requirePasswordBridge) {
+      throw new Error("Secure HODLMM execution requires HODLMM_MOVE_LIQUIDITY_CMD to resolve to a Bun-runnable script path");
+    }
+    return runExternalJsonCommand(command, args, extraEnv);
+  }
+
+  const wrapperPath = join(
+    tmpdir(),
+    `sbtc-yield-maximizer-hodlmm-wrapper-${process.pid}-${Date.now()}.mjs`
+  );
+  const wrapperSource = [
+    `process.argv = ["bun", ${JSON.stringify(scriptTarget)}, ...JSON.parse(process.env.HODLMM_WRAPPER_ARGS || "[]"), ...(process.env.AIBTC_WALLET_PASSWORD ? ["--password", process.env.AIBTC_WALLET_PASSWORD] : [])];`,
+    `await import(${JSON.stringify(scriptTarget)});`,
+  ].join("\n");
+
+  await Bun.write(wrapperPath, wrapperSource);
+  try {
+    return await runExternalJsonCommand(["bun", wrapperPath], [], {
+      ...extraEnv,
+      HODLMM_WRAPPER_ARGS: JSON.stringify(args),
+    });
+  } finally {
+    try {
+      unlinkSync(wrapperPath);
+    } catch {}
+  }
+}
+
 async function preflightHodlmmMove(context: Context, options: RunOptions, extraEnv: Record<string, string> = {}): Promise<ExternalCommandResult> {
   const top = context.decision.topHodlmm;
   if (!top) throw new Error("No HODLMM pool selected for preflight");
   const command = resolveHodlmmCommand();
-  return runExternalJsonCommand(command, [
-    "run",
+  const result = await runHodlmmJsonCommand(command, [
+    "scan",
     "--wallet",
     context.wallet.address,
-    "--pool",
-    top.poolId,
-    "--spread",
-    String(options.hodlmmSpread),
   ], extraEnv);
+  const positions = ((result.data as Record<string, unknown> | undefined)?.positions || []) as HodlmmScanPosition[];
+  const selected = positions.find((position) => (position.pool_id || position.poolId) === top.poolId);
+  if (!selected) {
+    throw new Error(`HODLMM preflight did not find a position for pool ${top.poolId}`);
+  }
+  const inRange = selected.in_range ?? selected.inRange ?? false;
+  if (inRange) {
+    throw new Error(`HODLMM preflight found pool ${top.poolId} already in range`);
+  }
+  return result;
 }
 
 async function executeHodlmmMove(context: Context, options: RunOptions, password: string): Promise<{ txid: string; explorerUrl: string; command: string[]; preflight: ExternalCommandResult }> {
@@ -713,7 +783,7 @@ async function executeHodlmmMove(context: Context, options: RunOptions, password
 
   try {
     const preflight = await preflightHodlmmMove(context, options, extraEnv);
-    const result = await runExternalJsonCommand(command, [
+    const result = await runHodlmmJsonCommand(command, [
       "run",
       "--wallet",
       context.wallet.address,
@@ -722,9 +792,7 @@ async function executeHodlmmMove(context: Context, options: RunOptions, password
       "--spread",
       String(options.hodlmmSpread),
       "--confirm",
-      "--password",
-      password,
-    ], extraEnv);
+    ], extraEnv, true);
 
     const transaction = ((result.data as Record<string, unknown> | undefined)?.transaction || null) as Record<string, unknown> | null;
     const txid = String(transaction?.txid || "");
@@ -924,7 +992,7 @@ async function runMaximize(options: RunOptions): Promise<void> {
 
   let releaseLock: (() => void) | null = null;
   try {
-    releaseLock = acquireNonceLock(context.wallet.id);
+    releaseLock = acquireExecutionLock(context.wallet.id);
 
     if (context.decision.route === "deploy-to-hodlmm") {
       const execution = await executeHodlmmMove(context, options, password);
