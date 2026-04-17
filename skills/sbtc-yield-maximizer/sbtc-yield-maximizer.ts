@@ -112,6 +112,7 @@ interface BinsResponse {
 
 interface UserPositionBin {
   bin_id: number;
+  userLiquidity?: string | number;
   user_liquidity?: string;
   liquidity?: string;
 }
@@ -430,7 +431,7 @@ async function fetchUserPositionBins(address: string, poolId: string): Promise<n
     if (!response.ok) throw new Error(`HTTP ${response.status} from ${BITFLOW_APP_USER_POSITIONS_API}/${address}/positions/${poolId}/bins`);
     const data = (await response.json()) as UserPositionBinsResponse;
     return (data.bins || [])
-      .filter((bin) => toBigInt(bin.user_liquidity || bin.liquidity || "0") > 0n)
+      .filter((bin) => toBigInt(bin.userLiquidity ?? bin.user_liquidity ?? bin.liquidity ?? "0") > 0n)
       .map((bin) => Number(bin.bin_id))
       .sort((a, b) => a - b);
   } finally {
@@ -644,12 +645,12 @@ function resolveHodlmmCommand(): string[] {
   throw new Error("HODLMM_MOVE_LIQUIDITY_CMD is not set and hodlmm-move-liquidity is not installed in PATH");
 }
 
-async function runExternalJsonCommand(command: string[], args: string[]): Promise<ExternalCommandResult> {
+async function runExternalJsonCommand(command: string[], args: string[], extraEnv: Record<string, string> = {}): Promise<ExternalCommandResult> {
   const proc = Bun.spawn({
     cmd: [...command, ...args],
     stdout: "pipe",
     stderr: "pipe",
-    env: process.env,
+    env: { ...process.env, ...extraEnv },
   });
   const stdout = await new Response(proc.stdout).text();
   const stderr = await new Response(proc.stderr).text();
@@ -657,14 +658,19 @@ async function runExternalJsonCommand(command: string[], args: string[]): Promis
   if (exitCode !== 0) {
     throw new Error(stderr.trim() || stdout.trim() || `External command failed with exit code ${exitCode}`);
   }
+  let parsed: ExternalCommandResult;
   try {
-    return JSON.parse(stdout.trim()) as ExternalCommandResult;
+    parsed = JSON.parse(stdout.trim()) as ExternalCommandResult;
   } catch {
     throw new Error(`Could not parse external JSON output: ${stdout.trim() || stderr.trim()}`);
   }
+  if (parsed.status === "error") {
+    throw new Error(parsed.error || "External command reported an error");
+  }
+  return parsed;
 }
 
-async function preflightHodlmmMove(context: Context, options: RunOptions): Promise<ExternalCommandResult> {
+async function preflightHodlmmMove(context: Context, options: RunOptions, extraEnv: Record<string, string> = {}): Promise<ExternalCommandResult> {
   const top = context.decision.topHodlmm;
   if (!top) throw new Error("No HODLMM pool selected for preflight");
   const command = resolveHodlmmCommand();
@@ -676,7 +682,7 @@ async function preflightHodlmmMove(context: Context, options: RunOptions): Promi
     top.poolId,
     "--spread",
     String(options.hodlmmSpread),
-  ]);
+  ], extraEnv);
 }
 
 async function executeHodlmmMove(context: Context, options: RunOptions, password: string): Promise<{ txid: string; explorerUrl: string; command: string[]; preflight: ExternalCommandResult }> {
@@ -687,29 +693,47 @@ async function executeHodlmmMove(context: Context, options: RunOptions, password
     throw new Error(`hodlmm-move-liquidity cooldown is active for another ${externalCooldown.remainingHours} hours`);
   }
 
-  const command = resolveHodlmmCommand();
-  const preflight = await preflightHodlmmMove(context, options);
-  if (preflight.status !== "success") {
-    throw new Error(preflight.error || "HODLMM preflight failed");
+  const walletManager = getWalletManager();
+  const account = await walletManager.unlock(context.wallet.id, password);
+  const privateKey = String(
+    (account as Record<string, unknown>).stxPrivateKey ||
+    (account as Record<string, unknown>).privateKey ||
+    ""
+  );
+  if (!privateKey) {
+    await walletManager.lock().catch(() => undefined);
+    throw new Error("Selected wallet did not expose stxPrivateKey for delegated HODLMM execution");
   }
 
-  const result = await runExternalJsonCommand(command, [
-    "run",
-    "--wallet",
-    context.wallet.address,
-    "--pool",
-    top.poolId,
-    "--spread",
-    String(options.hodlmmSpread),
-    "--confirm",
-    "--password",
-    password,
-  ]);
+  const command = resolveHodlmmCommand();
+  const extraEnv = {
+    STACKS_PRIVATE_KEY: privateKey,
+    STACKS_ADDRESS: context.wallet.address,
+  };
 
-  const txid = String((result.data as Record<string, unknown> | undefined)?.transaction && ((result.data as Record<string, unknown>).transaction as Record<string, unknown>).txid || "");
-  const explorerUrl = String((result.data as Record<string, unknown> | undefined)?.transaction && ((result.data as Record<string, unknown>).transaction as Record<string, unknown>).explorer || "");
-  if (!txid) throw new Error("HODLMM execution succeeded but returned no txid");
-  return { txid, explorerUrl, command, preflight };
+  try {
+    const preflight = await preflightHodlmmMove(context, options, extraEnv);
+    const result = await runExternalJsonCommand(command, [
+      "run",
+      "--wallet",
+      context.wallet.address,
+      "--pool",
+      top.poolId,
+      "--spread",
+      String(options.hodlmmSpread),
+      "--confirm",
+      "--password",
+      password,
+    ], extraEnv);
+
+    const transaction = ((result.data as Record<string, unknown> | undefined)?.transaction || null) as Record<string, unknown> | null;
+    const txid = String(transaction?.txid || "");
+    const explorerUrl = String(transaction?.explorer || "");
+    if (!txid) throw new Error("HODLMM execution succeeded but returned no txid");
+    return { txid, explorerUrl, command, preflight };
+  } finally {
+    await walletManager.lock().catch(() => undefined);
+  }
 }
 
 async function collectContext(options: RunOptions): Promise<Context> {
